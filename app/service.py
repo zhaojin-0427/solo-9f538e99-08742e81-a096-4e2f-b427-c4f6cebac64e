@@ -16,42 +16,17 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 
+from . import db, reconciliation
+from .errors import ConflictError, NotFoundError, RehearsalError
 from .models import PriceIn, WaybillIn, WeighIn
-
-META_VERSION = "version"
-
-
-class RehearsalError(Exception):
-    """服务层基类。"""
-
-
-class NotFoundError(RehearsalError):
-    """记录不存在（撤回不存在的记录号）。"""
-
-
-class ConflictError(RehearsalError):
-    """运单号已存在等冲突。"""
-
-
-# --------------------------------------------------------------------------- #
-# 小工具
-# --------------------------------------------------------------------------- #
 
 
 def get_version(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key = ?", (META_VERSION,)
-    ).fetchone()
-    return int(row["value"]) if row else 0
+    return db.get_version(conn)
 
 
 def _bump_version(conn: sqlite3.Connection) -> int:
-    new_version = get_version(conn) + 1
-    conn.execute(
-        "UPDATE meta SET value = ? WHERE key = ?",
-        (str(new_version), META_VERSION),
-    )
-    return new_version
+    return db.bump_version(conn)
 
 
 def _months_for(conn: sqlite3.Connection, waybill_nos: set[str]) -> list[str]:
@@ -145,15 +120,23 @@ def _recompute(
 
 
 def _finish(
-    conn: sqlite3.Connection, waybill_nos: set[str], extra_months: list[str]
+    conn: sqlite3.Connection,
+    waybill_nos: set[str],
+    extra_months: list[str],
+    recheck_weighs: tuple[str, ...] = (),
+    recheck_prices: tuple[str, ...] = (),
 ) -> dict:
     months = sorted(set(_months_for(conn, waybill_nos)) | set(extra_months))
     _recompute(conn, waybill_nos, months)
+    recon = reconciliation.apply_source_change(
+        conn, waybill_nos, recheck_weighs, recheck_prices
+    )
     version = _bump_version(conn)
     return {
         "version": version,
         "affected_waybills": len(waybill_nos),
         "affected_months": months,
+        "detail": recon,
     }
 
 
@@ -226,8 +209,13 @@ def upsert_weigh(conn: sqlite3.Connection, data: WeighIn) -> dict:
         "note=excluded.note",
         (data.record_no, data.train_no, data.weight_kg, data.note),
     )
-    result = _finish(conn, _waybills_by_trains(conn, affected_trains), [])
-    result["detail"] = {"created": created, "record_no": data.record_no}
+    result = _finish(
+        conn,
+        _waybills_by_trains(conn, affected_trains),
+        [],
+        recheck_weighs=(data.record_no,),
+    )
+    result["detail"].update({"created": created, "record_no": data.record_no})
     return result
 
 
@@ -240,8 +228,10 @@ def withdraw_weigh(conn: sqlite3.Connection, record_no: str) -> dict:
         raise NotFoundError(f"过磅单记录号不存在: {record_no}")
     affected = _waybills_by_trains(conn, {old["train_no"]})
     conn.execute("DELETE FROM weigh_records WHERE record_no = ?", (record_no,))
-    result = _finish(conn, affected, [])
-    result["detail"] = {"withdrawn": record_no}
+    result = _finish(
+        conn, affected, [], recheck_weighs=(record_no,)
+    )
+    result["detail"]["withdrawn"] = record_no
     return result
 
 
@@ -309,8 +299,13 @@ def upsert_price(conn: sqlite3.Connection, data: PriceIn) -> dict:
             data.note,
         ),
     )
-    result = _finish(conn, _waybills_in_price_scope(conn, scopes), [])
-    result["detail"] = {"created": created, "record_no": data.record_no}
+    result = _finish(
+        conn,
+        _waybills_in_price_scope(conn, scopes),
+        [],
+        recheck_prices=(data.record_no,),
+    )
+    result["detail"].update({"created": created, "record_no": data.record_no})
     return result
 
 
@@ -331,8 +326,10 @@ def withdraw_price(conn: sqlite3.Connection, record_no: str) -> dict:
     ]
     affected = _waybills_in_price_scope(conn, scopes)
     conn.execute("DELETE FROM price_records WHERE record_no = ?", (record_no,))
-    result = _finish(conn, affected, [])
-    result["detail"] = {"withdrawn": record_no}
+    result = _finish(
+        conn, affected, [], recheck_prices=(record_no,)
+    )
+    result["detail"]["withdrawn"] = record_no
     return result
 
 
@@ -354,11 +351,14 @@ def full_rebuild(conn: sqlite3.Connection) -> dict:
         ).fetchall()
     ]
     _recompute(conn, all_nos, months)
+    # 对账也全量重建：重新判定实收组合的应收属性与差异票。
+    reconciliation.rebuild_all(conn)
     version = _bump_version(conn)
     return {
         "version": version,
         "affected_waybills": len(all_nos),
         "affected_months": months,
+        "detail": {"rebuilt": True},
     }
 
 

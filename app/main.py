@@ -12,13 +12,16 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
-from . import db, service
+from . import db, reconciliation, service
 from .models import (
     AnomalyPage,
+    DiffPage,
     Health,
     MonthTotal,
     Overview,
     PriceIn,
+    ReceiptBatch,
+    ReconMonthSummary,
     RehearsalWaybill,
     WaybillBatch,
     WeighIn,
@@ -33,12 +36,14 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="运费入仓预演",
-    version="1.0.0",
+    title="运费入仓预演与对账",
+    version="1.1.0",
     description=(
         "一张运单关联过磅单（按车次）与价目（按始发站+发车日，有效期含首尾）"
         "两张来源表，预演两次内连接的计费行数与漏配/重复异常。"
-        "来源与预演结果同事务原子生效；查询只读预演结果表。"
+        "另提供按发车月提交实收清单的运费对账：按运单号分页列出差异票，"
+        "分别报告应收未收组合数、不应收却实收组合数与重复行数。"
+        "来源与预演/对账结果同事务原子生效；查询只读结果表。"
     ),
     lifespan=lifespan,
 )
@@ -220,6 +225,74 @@ def get_waybill(
             return service.rehearsal_detail(conn, waybill_no.strip())
         except service.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+
+
+# --------------------------------------------------------------------------- #
+# 运费对账
+# --------------------------------------------------------------------------- #
+
+
+@app.post(
+    "/reconciliation/months/{departure_mon}/receipts",
+    response_model=WriteResult,
+    tags=["运费对账"],
+    summary="按发车月整月提交实收清单（新清单与新差异一起替换旧结果）",
+)
+def submit_receipts(
+    departure_mon: str,
+    batch: ReceiptBatch,
+    conn: sqlite3.Connection = Depends(db.get_connection),
+):
+    """每行填运单号、过磅单号、价目号。
+
+    运单须已导入且属于该发车月；来源单号已撤回也照收（会判为不应收到）。
+    清单校验失败时整批回滚，旧清单与旧差异保持可读。
+    """
+    return _write(
+        conn,
+        lambda c: reconciliation.submit_receipts(c, departure_mon, batch.lines),
+    )
+
+
+def _snapshot_read(conn: sqlite3.Connection, fn):
+    """只读快照执行；服务层校验错误（如月份格式）转 422，而不是 500。"""
+    with db.snapshot(conn):
+        try:
+            return fn()
+        except service.RehearsalError as exc:
+            raise _translate(exc)
+
+
+@app.get(
+    "/reconciliation/months/{departure_mon}/diffs",
+    response_model=DiffPage,
+    tags=["运费对账"],
+    summary="按运单号分页列出有差异的票（键集翻页，不遍历已核平票）",
+)
+def list_diffs(
+    departure_mon: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None, description="上一页返回的 next_cursor"),
+    conn: sqlite3.Connection = Depends(db.get_connection),
+):
+    return _snapshot_read(
+        conn, lambda: reconciliation.diff_page(conn, departure_mon, limit, cursor)
+    )
+
+
+@app.get(
+    "/reconciliation/months/{departure_mon}/summary",
+    response_model=ReconMonthSummary,
+    tags=["运费对账"],
+    summary="整月差异汇总：少收组合数、不应收却实收组合数、重复行数",
+)
+def recon_summary(
+    departure_mon: str,
+    conn: sqlite3.Connection = Depends(db.get_connection),
+):
+    return _snapshot_read(
+        conn, lambda: reconciliation.month_summary(conn, departure_mon)
+    )
 
 
 # --------------------------------------------------------------------------- #

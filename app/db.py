@@ -127,6 +127,55 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
+-- ------------------------------------------------------------------ #
+-- 运费对账（实收清单）结果表
+--
+-- recon_receipts：按月提交的实收清单，按（运单、过磅单号、价目号）
+--   去重后每组合一行；line_count 记录原始行数（>=2 的部分即重复行）。
+--   is_expected 是“该组合在当前来源下是否应收”的物化标记。
+-- recon_tickets：有实收清单的运单汇总（用于来源更正时按增量维护）。
+-- recon_diffs：只保存“有差异”的运单，供按运单号翻页时直接定位，
+--   不包含已核平运单，因此翻页不会遍历已核平的票。
+--
+-- 注意：这里只存组合计数，不存“应收组合”的笛卡尔展开行。
+-- 应收组合总数由预演结果 match_stats 的 weigh_hits * price_hits 得出。
+-- ------------------------------------------------------------------ #
+CREATE TABLE IF NOT EXISTS recon_receipts (
+    departure_mon    TEXT NOT NULL,
+    waybill_no       TEXT NOT NULL,
+    weigh_record_no  TEXT NOT NULL,
+    price_record_no  TEXT NOT NULL,
+    line_count       INTEGER NOT NULL,
+    is_expected      INTEGER NOT NULL,
+    PRIMARY KEY (departure_mon, waybill_no, weigh_record_no, price_record_no)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS recon_tickets (
+    departure_mon        TEXT NOT NULL,
+    waybill_no           TEXT NOT NULL,
+    expected_received    INTEGER NOT NULL,
+    unexpected_received  INTEGER NOT NULL,
+    duplicate_rows       INTEGER NOT NULL,
+    receipt_rows         INTEGER NOT NULL,
+    PRIMARY KEY (departure_mon, waybill_no)
+) WITHOUT ROWID;
+
+-- 已提交过实收清单的发车月。只有这些月份才产生“整票未收”的差异票；
+-- 未提交的月份不臆造 0 实收。
+CREATE TABLE IF NOT EXISTS recon_months (
+    departure_mon TEXT PRIMARY KEY
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS recon_diffs (
+    departure_mon        TEXT NOT NULL,
+    waybill_no           TEXT NOT NULL,
+    expected_received    INTEGER NOT NULL,
+    unexpected_received  INTEGER NOT NULL,
+    duplicate_rows       INTEGER NOT NULL,
+    receipt_rows         INTEGER NOT NULL,
+    PRIMARY KEY (departure_mon, waybill_no)
+) WITHOUT ROWID;
+
 CREATE INDEX IF NOT EXISTS idx_waybills_train
     ON waybills(train_no);
 CREATE INDEX IF NOT EXISTS idx_waybills_origin_dt
@@ -139,6 +188,12 @@ CREATE INDEX IF NOT EXISTS idx_match_anomaly
     ON match_stats(is_anomaly, departure_mon, waybill_no);
 CREATE INDEX IF NOT EXISTS idx_match_month
     ON match_stats(departure_mon);
+CREATE INDEX IF NOT EXISTS idx_recon_receipts_waybill
+    ON recon_receipts(waybill_no, departure_mon);
+CREATE INDEX IF NOT EXISTS idx_recon_receipts_weigh
+    ON recon_receipts(weigh_record_no);
+CREATE INDEX IF NOT EXISTS idx_recon_receipts_price
+    ON recon_receipts(price_record_no);
 """
 
 
@@ -152,6 +207,25 @@ def init_db(db_path: str | Path | None = None) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+META_VERSION = "version"
+
+
+def get_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (META_VERSION,)
+    ).fetchone()
+    return int(row["value"]) if row else 0
+
+
+def bump_version(conn: sqlite3.Connection) -> int:
+    new_version = get_version(conn) + 1
+    conn.execute(
+        "UPDATE meta SET value = ? WHERE key = ?",
+        (str(new_version), META_VERSION),
+    )
+    return new_version
 
 
 # 允许测试通过环境变量/依赖覆盖切换数据库路径。

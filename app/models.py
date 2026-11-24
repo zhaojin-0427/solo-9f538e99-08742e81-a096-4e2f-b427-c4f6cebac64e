@@ -123,6 +123,60 @@ class Overview(BaseModel):
     anomalies: AnomalyPage
 
 
+# --------------------------------------------------------------------------- #
+# 运费对账
+# --------------------------------------------------------------------------- #
+
+
+class ReceiptLine(BaseModel):
+    """实收清单一行：运单号 + 过磅单号 + 价目号。"""
+
+    waybill_no: str = Field(min_length=1, max_length=64)
+    weigh_record_no: str = Field(min_length=1, max_length=64)
+    price_record_no: str = Field(min_length=1, max_length=64)
+
+    @field_validator("waybill_no", "weigh_record_no", "price_record_no")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空字符串")
+        return v
+
+
+class ReceiptBatch(BaseModel):
+    """整月实收清单；lines 必填，允许空列表（显式表示当月零实收）。"""
+
+    lines: list[ReceiptLine] = Field(max_length=100_000)
+
+
+class DiffTicket(BaseModel):
+    waybill_no: str
+    departure_mon: str
+    expected_total: int = Field(description="该票应收组合数（预演生成行数）")
+    expected_received: int = Field(description="已收到的应收组合数")
+    missing_expected: int = Field(description="应收却未收到的组合数")
+    unexpected_received: int = Field(description="不应收到却实收的组合数")
+    duplicate_rows: int = Field(description="重复行数（第二次起计）")
+    received_rows: int = Field(description="清单中该票的原始行数")
+
+
+class DiffPage(BaseModel):
+    items: list[DiffTicket]
+    next_cursor: str | None
+    limit: int
+    count: int
+
+
+class ReconMonthSummary(BaseModel):
+    departure_mon: str
+    diff_tickets: int
+    missing_expected: int
+    unexpected_received: int
+    duplicate_rows: int
+
+
+
 class Health(BaseModel):
     status: Literal["ok"]
     version: int
